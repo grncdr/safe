@@ -1,0 +1,289 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# safe — sandbox-exec wrapper for running AI agents on a project.
+#
+# Grants full RW on the project directory (the one containing .safe.yml) and
+# a minimal set of paths outside it (per .safe.yml, plus optional sibling
+# .safe.local.yml). Because sandbox-exec enforces the real guardrail, the
+# agent's own permission system is bypassed where supported.
+#
+# Usage: safe [claude|codex|opencode|<anything>] [args...]
+
+require 'yaml'
+require 'digest'
+require 'fileutils'
+
+# Walk up from CWD to find .safe.yml; that directory is the project root.
+def find_project_root(start = Dir.pwd)
+  dir = File.expand_path(start)
+  loop do
+    return dir if File.exist?(File.join(dir, '.safe.yml'))
+    parent = File.dirname(dir)
+    return nil if parent == dir
+    dir = parent
+  end
+end
+
+ROOT = find_project_root or abort 'safe: no .safe.yml found in current directory or any ancestor.'
+PROJECT_YML  = File.join(ROOT, '.safe.yml')
+LOCAL_YML = File.join(ROOT, '.safe.local.yml')
+CACHE = File.expand_path('~/.cache/safe')
+
+# Re-exec inside the project's devbox environment if present and we aren't already.
+if File.exist?(File.join(ROOT, 'devbox.json')) && ENV['DEVBOX_PROJECT_ROOT'] != ROOT
+  Dir.chdir(ROOT)
+  begin
+    exec 'devbox', 'run', '--', File.expand_path(__FILE__), *ARGV
+  rescue Errno::ENOENT
+    # devbox not installed; continue without it.
+  end
+end
+
+abort 'safe requires macOS (sandbox-exec).' unless RUBY_PLATFORM.include?('darwin')
+
+# Known agents get their own permission prompts turned off.
+def agent_argv(argv)
+  cmd, *rest = argv
+  case cmd
+  when 'claude'   then ['claude',   '--dangerously-skip-permissions', *rest]
+  when 'codex'    then ['codex',    '--dangerously-bypass-approvals-and-sandbox', *rest]
+  when 'opencode'
+    ENV['OPENCODE_PERMISSION'] = '{"*":"allow"}'
+    ['opencode', *rest]
+  else argv
+  end
+end
+
+# Named bundles of grants (paths + optional mach services). Keep these small — devbox owns most toolchain state.
+RECIPES = {
+  'devbox' => {
+    'read'  => %w[/nix/store],
+    'write' => %w[~/.devbox ~/.cache/devbox ~/.local/share/devbox],
+  },
+  'git' => {
+    'read' => %w[~/.gitconfig ~/.gitconfig.local ~/.config/git
+                 ~/.ssh/config ~/.ssh/known_hosts],
+  },
+  'gh' => {
+    'write' => %w[~/.config/gh ~/.cache/gh ~/.local/share/gh ~/.local/state/gh],
+  },
+  'claude' => {
+    'write' => %w[~/.claude ~/.claude.json ~/.config/claude ~/.cache/claude
+                  ~/.local/share/claude ~/.local/state/claude ~/.local/bin/claude],
+    'mach'  => %w[com.apple.SecurityServer],
+  },
+  'codex' => {
+    'write' => %w[~/.codex ~/.cache/codex ~/.local/bin/codex],
+  },
+  'opencode' => {
+    'write' => %w[~/.opencode ~/.config/opencode ~/.cache/opencode
+                  ~/.local/share/opencode ~/.local/state/opencode
+                  ~/.local/bin/opencode ~/.config/github-copilot],
+  },
+}.freeze
+
+NETWORK = {
+  'open'      => '(allow network*)',
+  'outbound'  => '(allow network-outbound)',
+  'localhost' => %[(allow network-outbound)\n(allow network-bind (local ip "localhost:*"))\n(allow network-inbound (local ip "localhost:*"))],
+  'none'      => ';; network: none',
+}.freeze
+
+BASELINE = <<~SB
+  (version 1)
+  (deny default)
+
+  (allow process-exec)
+  (allow process-fork)
+  (allow sysctl-read)
+  (allow pseudo-tty)
+  (allow system-socket)
+  (allow process-info* (target same-sandbox))
+  (allow signal (target same-sandbox))
+  (allow mach-priv-task-port (target same-sandbox))
+
+  (allow file-read*
+    (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt")
+    (subpath "/System/Library") (subpath "/System/Volumes/Preboot")
+    (subpath "/Library/Apple") (subpath "/Library/Frameworks") (subpath "/Library/Fonts")
+    (literal "/Library/Preferences/.GlobalPreferences.plist")
+    (literal "/dev") (literal "/private") (literal "/private/var")
+    (subpath "/private/var/db/timezone")
+    (literal "/private/etc/hosts") (literal "/private/etc/resolv.conf")
+    (literal "/private/etc/services") (literal "/private/etc/protocols")
+    (literal "/private/etc/localtime") (literal "/private/etc/shells")
+    (subpath "/private/etc/ssl")
+    (literal "/etc") (literal "/var"))
+
+  (allow file-read-metadata
+    (subpath "/System") (subpath "/private/var/run")
+    (literal "/home") (literal "/private/etc") (subpath "/dev"))
+
+  (allow file-read* file-write*
+    (subpath "/tmp") (subpath "/private/tmp")
+    (subpath "/var/folders") (subpath "/private/var/folders")
+    (subpath "/dev/fd")
+    (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/null")
+    (literal "/dev/tty") (literal "/dev/ptmx")
+    (regex #"^/dev/tty") (regex #"^/dev/ttys") (regex #"^/dev/pty"))
+
+  (allow file-read*
+    (literal "/dev/zero") (literal "/dev/urandom") (literal "/dev/random")
+    (literal "/dev/autofs_nowait") (literal "/dev/dtracehelper"))
+
+  (allow file-ioctl
+    (literal "/dev/tty") (literal "/dev/ptmx") (literal "/dev/dtracehelper")
+    (regex #"^/dev/tty") (regex #"^/dev/ttys") (regex #"^/dev/pty"))
+
+  (allow mach-lookup
+    (global-name "com.apple.system.notification_center")
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.opendirectoryd.membership")
+    (global-name "com.apple.logd") (global-name "com.apple.FSEvents")
+    (global-name "com.apple.SystemConfiguration.configd")
+    (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+    (global-name "com.apple.trustd.agent") (global-name "com.apple.diagnosticd")
+    (global-name "com.apple.analyticsd") (global-name "com.apple.dnssd.service")
+    (global-name "com.apple.CoreServices.coreservicesd")
+    (global-name "com.apple.coreservices.launchservicesd")
+    (global-name "com.apple.DiskArbitration.diskarbitrationd")
+    (global-name "com.apple.system.logger") (global-name "com.apple.bsd.dirhelper"))
+
+  (allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))
+SB
+
+# Emitted AFTER every allow so SBPL's last-match-wins keeps these inviolable.
+HARD_DENIES = <<~SB
+  (deny network-outbound
+    (remote unix-socket (path-literal "/var/run/docker.sock"))
+    (remote unix-socket (path-literal "/private/var/run/docker.sock")))
+
+  (deny file-read* file-write*
+    (regex #"^/private/tmp/com\\.apple\\.launchd\\.[^/]+/Listeners$")
+    (regex #"^/tmp/com\\.apple\\.launchd\\.[^/]+/Listeners$"))
+SB
+
+def esc(s)
+  s.gsub(/[\\"]/) { |c| '\\' + c }
+end
+
+def matcher(path)
+  if    path.end_with?('/')   then [:subpath, path.chomp('/')]
+  elsif path.end_with?('*')   then [:prefix,  path.chomp('*')]
+  elsif File.directory?(path) then [:subpath, path]
+  else                             [:literal, path]
+  end
+end
+
+def ancestor_literals(path)
+  parts = path.split('/').reject(&:empty?)
+  anc = ['/'] + (1..parts.length).map { |i| '/' + parts[0, i].join('/') }
+  anc.map { |a| %[(literal "#{esc(a)}")] }.join(' ')
+end
+
+def allow_rule(path, modes)
+  abs = File.expand_path(path)
+  match, target = matcher(abs)
+  ops = modes.map { |m| m == :read ? 'file-read*' : 'file-write*' }.join(' ')
+  lines = [%[(allow file-read* #{ancestor_literals(target)})]]
+  lines << %[(allow #{ops} (#{match} "#{esc(target)}"))]
+  real = File.realpath(target) rescue nil
+  lines << %[(allow #{ops} (#{match} "#{esc(real)}"))] if real && real != target
+  lines.join("\n")
+end
+
+def deny_rule(path, modes)
+  abs = File.expand_path(path)
+  match, target = matcher(abs)
+  ops = modes.map { |m| m == :read ? 'file-read*' : 'file-write*' }.join(' ')
+  %[(deny #{ops} (#{match} "#{esc(target)}"))]
+end
+
+def load_cfg(path)
+  return {} unless File.exist?(path)
+  YAML.safe_load(File.read(path)) || {}
+end
+
+def canonicalize(obj)
+  case obj
+  when Hash  then obj.sort.to_h.transform_values { |v| canonicalize(v) }
+  when Array then obj.map { |v| canonicalize(v) }
+  else obj
+  end
+end
+
+def merge_cfg(team, local)
+  {
+    'network' => local['network'] || team['network'] || 'open',
+    'use'     => (Array(team['use']) + Array(local['use'])).uniq,
+    'allow'   => {
+      'read'  => (Array(team.dig('allow', 'read'))  + Array(local.dig('allow', 'read'))).uniq,
+      'write' => (Array(team.dig('allow', 'write')) + Array(local.dig('allow', 'write'))).uniq,
+    },
+    'deny'    => {
+      'read'  => (Array(team.dig('deny', 'read'))   + Array(local.dig('deny', 'read'))).uniq,
+      'write' => (Array(team.dig('deny', 'write'))  + Array(local.dig('deny', 'write'))).uniq,
+    },
+    'append'  => [team['append'], local['append']].compact.reject(&:empty?).join("\n\n"),
+  }
+end
+
+def render_policy(cfg)
+  reads  = Array(cfg.dig('allow', 'read'))
+  writes = Array(cfg.dig('allow', 'write'))
+  machs  = []
+  cfg['use'].each do |name|
+    recipe = RECIPES.fetch(name) { abort "safe: unknown recipe #{name.inspect}" }
+    reads  += Array(recipe['read'])
+    writes += Array(recipe['write'])
+    machs  += Array(recipe['mach'])
+  end
+
+  network = NETWORK.fetch(cfg['network']) {
+    abort "safe: unknown network mode #{cfg['network'].inspect} (use: #{NETWORK.keys.join(', ')})"
+  }
+
+  mach_section = machs.empty? ? nil : [
+    ';; Recipe mach services',
+    "(allow mach-lookup\n  " +
+      machs.uniq.map { |n| %[(global-name "#{esc(n)}")] }.join("\n  ") + ')',
+  ]
+
+  sections = [
+    BASELINE,
+    ";; Network: #{cfg['network']}",
+    network,
+    mach_section,
+    *reads.uniq.map  { |p| allow_rule(p, [:read]) },
+    *writes.uniq.map { |p| allow_rule(p, [:read, :write]) },
+    ';; Project root',
+    allow_rule(ROOT, [:read, :write]),
+    (cfg['append'].empty? ? nil : [';; User append', cfg['append']]),
+    ';; Hard denies (emitted last — SBPL last-match-wins makes these inviolable)',
+    HARD_DENIES,
+    %[(deny file-write* (regex #"^#{Regexp.escape(ROOT)}/\\.safe(\\.local)?\\.yml$"))],
+    *Array(cfg.dig('deny', 'read')).map  { |p| deny_rule(p, [:read]) },
+    *Array(cfg.dig('deny', 'write')).map { |p| deny_rule(p, [:write]) },
+  ]
+  sections.compact.flatten.join("\n\n") + "\n"
+end
+
+FileUtils.mkdir_p(CACHE)
+
+canonical_inputs = [
+  ROOT,
+  YAML.dump(canonicalize(load_cfg(PROJECT_YML))),
+  YAML.dump(canonicalize(load_cfg(LOCAL_YML))),
+  File.read(__FILE__),
+  ENV['HOME'].to_s,
+].join("\0")
+key = Digest::SHA256.hexdigest(canonical_inputs)[0, 16]
+policy = File.join(CACHE, "policy-#{key}.sb")
+
+unless File.exist?(policy)
+  cfg = merge_cfg(load_cfg(PROJECT_YML), load_cfg(LOCAL_YML))
+  File.write(policy, render_policy(cfg))
+end
+
+exec 'sandbox-exec', '-f', policy, '--', *agent_argv(ARGV)
