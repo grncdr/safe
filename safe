@@ -44,10 +44,22 @@ def find_project_root(start = Dir.pwd)
   end
 end
 
+# If ROOT is a git worktree, return the main repo's .git directory.
+# Worktrees have .git as a file containing "gitdir: <main>/.git/worktrees/<name>";
+# git needs access to shared state (objects, refs, config) in <main>/.git.
+def worktree_main_git_dir(root)
+  dot_git = File.join(root, '.git')
+  return nil unless File.file?(dot_git)
+  return nil unless (m = File.read(dot_git).match(/^gitdir:\s*(.+)$/))
+  gitdir = File.expand_path(m[1].strip, root)
+  gitdir =~ %r{\A(.+/\.git)/worktrees/[^/]+\z} ? $1 : nil
+end
+
 ROOT = find_project_root or abort 'safe: no .safe.yml found in current directory or any ancestor.'
 PROJECT_YML  = File.join(ROOT, '.safe.yml')
 LOCAL_YML = File.join(ROOT, '.safe.local.yml')
 CACHE = File.expand_path('~/.cache/safe')
+WORKTREE_MAIN_GIT = worktree_main_git_dir(ROOT)
 
 # Re-exec inside the project's devbox environment if present and we aren't already.
 if File.exist?(File.join(ROOT, 'devbox.json')) && ENV['DEVBOX_PROJECT_ROOT'] != ROOT
@@ -278,6 +290,7 @@ def render_policy(cfg)
     *writes.uniq.map { |p| allow_rule(p, [:read, :write]) },
     ';; Project root',
     allow_rule(ROOT, [:read, :write]),
+    (WORKTREE_MAIN_GIT ? [';; Worktree: main repo .git', allow_rule(WORKTREE_MAIN_GIT, [:read, :write])] : nil),
     (cfg['append'].empty? ? nil : [';; User append', cfg['append']]),
     ';; Hard denies (emitted last — SBPL last-match-wins makes these inviolable)',
     HARD_DENIES,
@@ -292,6 +305,7 @@ FileUtils.mkdir_p(CACHE)
 
 canonical_inputs = [
   ROOT,
+  WORKTREE_MAIN_GIT.to_s,
   YAML.dump(canonicalize(load_cfg(PROJECT_YML))),
   YAML.dump(canonicalize(load_cfg(LOCAL_YML))),
   File.read(__FILE__),
