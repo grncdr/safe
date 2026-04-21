@@ -8,11 +8,30 @@
 # .safe.local.yml). Because sandbox-exec enforces the real guardrail, the
 # agent's own permission system is bypassed where supported.
 #
-# Usage: safe [claude|codex|opencode|<anything>] [args...]
+# Usage: safe install | safe [claude|codex|opencode|<anything>] [args...]
 
 require 'yaml'
 require 'digest'
 require 'fileutils'
+
+# Install this script to ~/.local/bin/safe.
+def install_self!
+  source = File.realpath(__FILE__) rescue File.expand_path(__FILE__)
+  target_dir = File.expand_path('~/.local/bin')
+  target = File.join(target_dir, 'safe')
+
+  FileUtils.mkdir_p(target_dir)
+  unless File.exist?(target) && File.identical?(source, target)
+    FileUtils.cp(source, target)
+  end
+  FileUtils.chmod(0o755, target)
+  puts "safe: installed to #{target}"
+end
+
+if ARGV.first == 'install'
+  install_self!
+  exit 0
+end
 
 # Walk up from CWD to find .safe.yml; that directory is the project root.
 def find_project_root(start = Dir.pwd)
