@@ -77,7 +77,7 @@ end
 # Named bundles of grants (paths + optional mach services). Keep these small — devbox owns most toolchain state.
 RECIPES = {
   'devbox' => {
-    'read'  => %w[/nix/store],
+    'read'  => %w[/nix],
     'write' => %w[~/.devbox ~/.cache/devbox ~/.local/share/devbox],
   },
   'git' => {
