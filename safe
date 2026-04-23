@@ -13,6 +13,8 @@
 require 'yaml'
 require 'digest'
 require 'fileutils'
+require 'json'
+require 'time'
 
 # Install this script to ~/.local/bin/safe.
 def install_self!
@@ -249,6 +251,7 @@ def merge_cfg(team, local)
   {
     'network' => local['network'] || team['network'] || 'open',
     'use'     => (Array(team['use']) + Array(local['use'])).uniq,
+    'aws'     => local['aws'] || team['aws'],
     'allow'   => {
       'read'  => (Array(team.dig('allow', 'read'))  + Array(local.dig('allow', 'read'))).uniq,
       'write' => (Array(team.dig('allow', 'write')) + Array(local.dig('allow', 'write'))).uniq,
@@ -292,9 +295,11 @@ def render_policy(cfg)
     ';; Project root',
     allow_rule(ROOT, [:read, :write]),
     (WORKTREE_MAIN_GIT ? [';; Worktree: main repo .git', allow_rule(WORKTREE_MAIN_GIT, [:read, :write])] : nil),
+    (cfg.dig('aws', 'profile') ? [';; AWS credentials (cached under ~/.cache/safe/aws/<profile>)', allow_rule(File.join(CACHE, 'aws', cfg.dig('aws', 'profile')), [:read])] : nil),
     (cfg['append'].empty? ? nil : [';; User append', cfg['append']]),
     ';; Hard denies (emitted last — SBPL last-match-wins makes these inviolable)',
     HARD_DENIES,
+    (cfg.dig('aws', 'profile') ? %[(deny file-read* (subpath "#{esc(File.expand_path('~/.aws'))}"))] : nil),
     %[(deny file-write* (regex #"^#{Regexp.escape(ROOT)}/\\.safe(\\.local)?\\.yml$"))],
     *Array(cfg.dig('deny', 'read')).map  { |p| deny_rule(p, [:read]) },
     *Array(cfg.dig('deny', 'write')).map { |p| deny_rule(p, [:write]) },
@@ -315,9 +320,128 @@ canonical_inputs = [
 key = Digest::SHA256.hexdigest(canonical_inputs)[0, 16]
 policy = File.join(CACHE, "policy-#{key}.sb")
 
-unless File.exist?(policy)
-  cfg = merge_cfg(load_cfg(PROJECT_YML), load_cfg(LOCAL_YML))
-  File.write(policy, render_policy(cfg))
+cfg = merge_cfg(load_cfg(PROJECT_YML), load_cfg(LOCAL_YML))
+
+# Per-profile credential cache. Determined (and created) before render_policy
+# so allow_rule picks the :subpath matcher via File.directory? even on first run.
+aws_dir = nil
+if (profile = cfg.dig('aws', 'profile'))
+  abort "safe: invalid AWS profile name #{profile.inspect}" unless profile.match?(/\A[\w\-\.]+\z/) && profile != '.' && profile != '..'
+  aws_dir = File.join(CACHE, 'aws', profile)
+  FileUtils.mkdir_p(aws_dir, mode: 0o700)
 end
 
-exec 'sandbox-exec', '-f', policy, '--', *agent_argv(ARGV)
+File.write(policy, render_policy(cfg)) unless File.exist?(policy)
+
+# AWS profile gating: cache resolved credentials under
+# ~/.cache/safe/aws/<profile>/ and refresh before they expire. A flock on
+# <aws_dir>/lock serializes refresh work across concurrent sessions that
+# share a profile. meta.json records the expiration so stale credentials
+# can be detected without shelling out to `aws`.
+AWS_REFRESH_LEEWAY = 300  # seconds before expiry at which we refresh
+
+def aws_export(profile)
+  out = IO.popen(['aws', 'configure', 'export-credentials', '--profile', profile, '--format', 'process'], err: [:child, :out], &:read)
+  raise "aws export-credentials for profile #{profile} failed: #{out.strip}" unless $?.success?
+  JSON.parse(out)
+end
+
+# Write under [default] AND [<profile>] so clients work whether AWS_PROFILE is
+# unset (defaults to "default") or set to the profile name — e.g. when claude
+# re-injects AWS_PROFILE from its own settings, the section still matches.
+def aws_write_creds(path, c, profile)
+  section = ->(name) do
+    s = +"[#{name}]\naws_access_key_id = #{c['AccessKeyId']}\naws_secret_access_key = #{c['SecretAccessKey']}\n"
+    s << "aws_session_token = #{c['SessionToken']}\n" if c['SessionToken']
+    s
+  end
+  body = section.call('default')
+  body << "\n" << section.call(profile) unless profile == 'default'
+  File.write("#{path}.tmp", body)
+  File.chmod(0o600, "#{path}.tmp")
+  File.rename("#{path}.tmp", path)
+end
+
+def aws_write_config(path, region, profile)
+  body = +"[default]\n"
+  body << "region = #{region}\n" unless region.empty?
+  unless profile == 'default'
+    body << "\n[profile #{profile}]\n"
+    body << "region = #{region}\n" unless region.empty?
+  end
+  File.write(path, body)
+end
+
+# :missing — no cached meta yet. :never — static creds with no expiration.
+def aws_meta_expiration(aws_dir)
+  meta_path = File.join(aws_dir, 'meta.json')
+  return :missing unless File.exist?(meta_path)
+  meta = JSON.parse(File.read(meta_path)) rescue nil
+  return :missing unless meta
+  return :never if meta['expiration'].nil?
+  Time.parse(meta['expiration']) rescue :missing
+end
+
+def aws_creds_stale?(aws_dir)
+  exp = aws_meta_expiration(aws_dir)
+  return true  if exp == :missing
+  return false if exp == :never
+  exp - Time.now < AWS_REFRESH_LEEWAY
+end
+
+def aws_ensure_fresh!(aws_dir, profile)
+  return unless aws_creds_stale?(aws_dir)
+  File.open(File.join(aws_dir, 'lock'), File::RDWR | File::CREAT, 0o600) do |lock|
+    lock.flock(File::LOCK_EX)
+    return unless aws_creds_stale?(aws_dir)  # another session may have refreshed while we waited
+    region = (IO.popen(['aws', 'configure', 'get', 'region', '--profile', profile], err: File::NULL, &:read).strip rescue '')
+    aws_write_config(File.join(aws_dir, 'config'), region, profile)
+    creds = aws_export(profile)
+    aws_write_creds(File.join(aws_dir, 'credentials'), creds, profile)
+    File.write(File.join(aws_dir, 'meta.json'), JSON.dump('expiration' => creds['Expiration']))
+  end
+end
+
+if aws_dir
+  begin
+    aws_ensure_fresh!(aws_dir, profile)
+  rescue => e
+    abort "safe: #{e.message}"
+  end
+
+  Thread.new do
+    loop do
+      exp = aws_meta_expiration(aws_dir)
+      break if exp == :never
+      sleep(exp == :missing ? 60 : [(exp - Time.now - AWS_REFRESH_LEEWAY), 60].max)
+      begin
+        aws_ensure_fresh!(aws_dir, profile)
+      rescue => e
+        warn "safe: AWS credential refresh failed: #{e.message}"
+        sleep 30
+      end
+    end
+  end
+
+  ENV.keys.grep(/^AWS_/).each { |k| ENV.delete(k) }
+  ENV['AWS_SHARED_CREDENTIALS_FILE'] = File.join(aws_dir, 'credentials')
+  ENV['AWS_CONFIG_FILE'] = File.join(aws_dir, 'config')
+end
+
+pid = Process.spawn('sandbox-exec', '-f', policy, '--', *agent_argv(ARGV))
+
+# Terminal signals (INT/TSTP/CONT) are delivered to the whole pgrp, so the child
+# gets them alongside us — we just need to keep Ruby from exiting on INT.
+Signal.trap('INT') { }
+# Explicit kills to the parent don't hit the child; forward them.
+%w[TERM HUP QUIT].each { |s| Signal.trap(s) { Process.kill(s, pid) rescue nil } }
+
+Process.wait(pid)
+
+status = $?
+if status.signaled?
+  Signal.trap(status.termsig, 'DEFAULT')
+  Process.kill(status.termsig, Process.pid)
+else
+  exit status.exitstatus
+end
