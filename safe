@@ -141,6 +141,7 @@ BASELINE = <<~SB
     (literal "/Library/Preferences/.GlobalPreferences.plist")
     (literal "/dev") (literal "/private") (literal "/private/var")
     (subpath "/private/var/db/timezone")
+    (subpath "/private/var/select")
     (literal "/private/etc/hosts") (literal "/private/etc/resolv.conf")
     (literal "/private/etc/services") (literal "/private/etc/protocols")
     (literal "/private/etc/localtime") (literal "/private/etc/shells")
