@@ -62,6 +62,8 @@ PROJECT_YML  = File.join(ROOT, '.safe.yml')
 LOCAL_YML = File.join(ROOT, '.safe.local.yml')
 CACHE = File.expand_path('~/.cache/safe')
 WORKTREE_MAIN_GIT = worktree_main_git_dir(ROOT)
+WORKTREE_MAIN     = WORKTREE_MAIN_GIT ? File.dirname(WORKTREE_MAIN_GIT) : nil
+WORKTREE_MAIN_YML = WORKTREE_MAIN ? File.join(WORKTREE_MAIN, '.safe.yml') : nil
 
 # Re-exec inside the project's devbox environment if present and we aren't already.
 if File.exist?(File.join(ROOT, 'devbox.json')) && ENV['DEVBOX_PROJECT_ROOT'] != ROOT
@@ -295,6 +297,7 @@ def render_policy(cfg)
     mach_section,
     *reads.uniq.map  { |p| allow_rule(p, [:read]) },
     *writes.uniq.map { |p| allow_rule(p, [:read, :write]) },
+    (WORKTREE_MAIN ? [';; Worktree: main repo (read-only)', allow_rule(WORKTREE_MAIN, [:read])] : nil),
     ';; Project root',
     allow_rule(ROOT, [:read, :write]),
     (WORKTREE_MAIN_GIT ? [';; Worktree: main repo .git', allow_rule(WORKTREE_MAIN_GIT, [:read, :write])] : nil),
@@ -304,6 +307,7 @@ def render_policy(cfg)
     HARD_DENIES,
     (cfg.dig('aws', 'profile') ? %[(deny file-read* (subpath "#{esc(File.expand_path('~/.aws'))}"))] : nil),
     %[(deny file-write* (regex #"^#{Regexp.escape(ROOT)}/\\.safe(\\.local)?\\.yml$"))],
+    (WORKTREE_MAIN ? %[(deny file-write* (regex #"^#{Regexp.escape(WORKTREE_MAIN)}/\\.safe(\\.local)?\\.yml$"))] : nil),
     *Array(cfg.dig('deny', 'read')).map  { |p| deny_rule(p, [:read]) },
     *Array(cfg.dig('deny', 'write')).map { |p| deny_rule(p, [:write]) },
   ]
@@ -317,6 +321,7 @@ canonical_inputs = [
   WORKTREE_MAIN_GIT.to_s,
   YAML.dump(canonicalize(load_cfg(PROJECT_YML))),
   YAML.dump(canonicalize(load_cfg(LOCAL_YML))),
+  WORKTREE_MAIN_YML ? YAML.dump(canonicalize(load_cfg(WORKTREE_MAIN_YML))) : '',
   File.read(__FILE__),
   ENV['HOME'].to_s,
 ].join("\0")
@@ -324,6 +329,16 @@ key = Digest::SHA256.hexdigest(canonical_inputs)[0, 16]
 policy = File.join(CACHE, "policy-#{key}.sb")
 
 cfg = merge_cfg(load_cfg(PROJECT_YML), load_cfg(LOCAL_YML))
+
+# Inherit deny rules from the main worktree's .safe.yml so the read grant on
+# the main worktree can't bypass paths the team has marked off-limits there.
+# Relative paths in the main config resolve against the main worktree, not cwd.
+if WORKTREE_MAIN_YML
+  main_cfg = load_cfg(WORKTREE_MAIN_YML)
+  rebase = ->(p) { File.expand_path(p, WORKTREE_MAIN) }
+  cfg['deny']['read']  = (cfg['deny']['read']  + Array(main_cfg.dig('deny', 'read')).map(&rebase)).uniq
+  cfg['deny']['write'] = (cfg['deny']['write'] + Array(main_cfg.dig('deny', 'write')).map(&rebase)).uniq
+end
 
 # Per-profile credential cache. Determined (and created) before render_policy
 # so allow_rule picks the :subpath matcher via File.directory? even on first run.

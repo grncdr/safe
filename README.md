@@ -79,7 +79,7 @@ Policy structure (order matters — SBPL is last-match-wins):
 - Network mode from `NETWORK` (`open`/`outbound`/`localhost`/`none`).
 - `use:` recipes from `RECIPES` (named bundles: `devbox`, `git`, `gh`, `claude`, `codex`, `opencode`).
 - User `allow.read` / `allow.write` via `allow_rule` → `matcher` picks `:subpath` (trailing `/` or real dir), `:prefix` (trailing `*`), or `:literal`. Each allow emits ancestor-literal reads so `stat` up the tree works.
-- `ROOT` RW. If `ROOT` is a git worktree, the main repo's `.git` dir is also RW.
+- `ROOT` RW. If `ROOT` is a git worktree, the main worktree is also granted read (so the agent can compare against / cherry-pick from main) and the main repo's `.git` dir is granted RW (shared git state). The main worktree's `.safe.yml` is consulted for `deny` rules (inherited so the read grant can't bypass team-defined off-limits paths), and writes to either worktree's `.safe.yml` / `.safe.local.yml` are denied.
 - `HARD_DENIES` emitted last so they override everything above. Also user `deny.*` rules and the write-deny on `.safe.yml`/`.safe.local.yml`.
 
 Known agents get permission-prompt bypass flags via `agent_argv` (`--dangerously-skip-permissions` etc.) — the sandbox is the real guardrail.
