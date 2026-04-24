@@ -109,6 +109,9 @@ RECIPES = {
   'codex' => {
     'write' => %w[~/.codex ~/.cache/codex ~/.local/bin/codex],
   },
+  'dev' => {
+    'read' => %w[~/.config/dev ~/.local/state/dev],
+  },
   'opencode' => {
     'write' => %w[~/.opencode ~/.config/opencode ~/.cache/opencode
                   ~/.local/share/opencode ~/.local/state/opencode
