@@ -36,6 +36,15 @@ use:
   - codex
   - opencode
 
+# Optional: restrict the sandboxed agent to a single AWS profile.
+# safe runs `aws configure export-credentials --profile <name>` on the host,
+# caches the result under ~/.cache/safe/aws/<name>/, grants the sandbox read
+# access to exactly that directory, and hard-denies ~/.aws. A background
+# thread refreshes the cached credentials before they expire.
+# Put this in .safe.local.yml if the profile name varies per machine.
+aws:
+  profile: my-profile
+
 allow:
   read:
     # ruby Resolv in stdlib reads this on startup
