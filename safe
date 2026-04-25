@@ -8,7 +8,7 @@
 # .safe.local.yml). Because sandbox-exec enforces the real guardrail, the
 # agent's own permission system is bypassed where supported.
 #
-# Usage: safe install | safe [claude|codex|opencode|<anything>] [args...]
+# Usage: safe install | safe clear-policy-cache | safe [claude|codex|opencode|<anything>] [args...]
 
 require 'yaml'
 require 'digest'
@@ -32,6 +32,13 @@ end
 
 if ARGV.first == 'install'
   install_self!
+  exit 0
+end
+
+if ARGV.first == 'clear-policy-cache'
+  policies = Dir[File.expand_path('~/.cache/safe/policy-*.sb')]
+  policies.each { |p| File.delete(p) }
+  puts "safe: removed #{policies.length} cached polic#{policies.length == 1 ? 'y' : 'ies'}"
   exit 0
 end
 

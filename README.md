@@ -9,9 +9,10 @@ Copy the script to your PATH
 ## Usage
 
 ```sh
-safe claude    # runs claude --dangerously-skip-permissions in the sandbox
-safe codex     # etc.
-safe opencode  # etc.
+safe claude              # runs claude --dangerously-skip-permissions in the sandbox
+safe codex               # etc.
+safe opencode            # etc.
+safe clear-policy-cache  # delete cached SBPL policies under ~/.cache/safe
 ```
 
 ## Config
