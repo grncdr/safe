@@ -112,7 +112,7 @@ RECIPES = {
     'write' => %w[~/.codex ~/.cache/codex ~/.local/bin/codex],
   },
   'dev' => {
-    'read' => %w[~/.config/dev ~/.local/state/dev],
+    'read' => %w[~/.config/dev ~/.local/state/dev ~/.local/bin/dev],
   },
   'opencode' => {
     'write' => %w[~/.opencode ~/.config/opencode ~/.cache/opencode
