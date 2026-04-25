@@ -215,18 +215,21 @@ def matcher(path)
   end
 end
 
-def ancestor_literals(path)
-  parts = path.split('/').reject(&:empty?)
-  anc = ['/'] + (1..parts.length).map { |i| '/' + parts[0, i].join('/') }
-  anc.map { |a| %[(literal "#{esc(a)}")] }.join(' ')
+def ancestors_of(target)
+  parts = target.split('/').reject(&:empty?)
+  ['/'] + (1..parts.length).map { |i| '/' + parts[0, i].join('/') }
+end
+
+def allow_target(path)
+  _, target = matcher(File.expand_path(path))
+  target
 end
 
 def allow_rule(path, modes)
   abs = File.expand_path(path)
   match, target = matcher(abs)
   ops = modes.map { |m| m == :read ? 'file-read*' : 'file-write*' }.join(' ')
-  lines = [%[(allow file-read* #{ancestor_literals(target)})]]
-  lines << %[(allow #{ops} (#{match} "#{esc(target)}"))]
+  lines = [%[(allow #{ops} (#{match} "#{esc(target)}"))]]
   real = File.realpath(target) rescue nil
   lines << %[(allow #{ops} (#{match} "#{esc(real)}"))] if real && real != target
   lines.join("\n")
@@ -290,18 +293,32 @@ def render_policy(cfg)
       machs.uniq.map { |n| %[(global-name "#{esc(n)}")] }.join("\n  ") + ')',
   ]
 
+  aws_cache = cfg.dig('aws', 'profile') ? File.join(CACHE, 'aws', cfg.dig('aws', 'profile')) : nil
+
+  # sandbox-exec needs read access on every parent directory to traverse
+  # into an allowed path. Collect ancestors for every allow target and emit
+  # one deduplicated block — emitting per-rule produced hundreds of repeated
+  # `(literal "/")`, `(literal "/Users")`, … entries in non-trivial policies.
+  allow_paths = reads.uniq + writes.uniq + [WORKTREE_MAIN, ROOT, WORKTREE_MAIN_GIT, aws_cache].compact
+  ancestors = allow_paths.flat_map { |p| ancestors_of(allow_target(p)) }.uniq
+  ancestor_block = [
+    ';; Ancestor read access (shared by every allow rule below)',
+    "(allow file-read*\n  " + ancestors.map { |a| %[(literal "#{esc(a)}")] }.join(' ') + ')',
+  ]
+
   sections = [
     BASELINE,
     ";; Network: #{cfg['network']}",
     network,
     mach_section,
+    ancestor_block,
     *reads.uniq.map  { |p| allow_rule(p, [:read]) },
     *writes.uniq.map { |p| allow_rule(p, [:read, :write]) },
     (WORKTREE_MAIN ? [';; Worktree: main repo (read-only)', allow_rule(WORKTREE_MAIN, [:read])] : nil),
     ';; Project root',
     allow_rule(ROOT, [:read, :write]),
     (WORKTREE_MAIN_GIT ? [';; Worktree: main repo .git', allow_rule(WORKTREE_MAIN_GIT, [:read, :write])] : nil),
-    (cfg.dig('aws', 'profile') ? [';; AWS credentials (cached under ~/.cache/safe/aws/<profile>)', allow_rule(File.join(CACHE, 'aws', cfg.dig('aws', 'profile')), [:read])] : nil),
+    (aws_cache ? [';; AWS credentials (cached under ~/.cache/safe/aws/<profile>)', allow_rule(aws_cache, [:read])] : nil),
     (cfg['append'].empty? ? nil : [';; User append', cfg['append']]),
     ';; Hard denies (emitted last — SBPL last-match-wins makes these inviolable)',
     HARD_DENIES,
