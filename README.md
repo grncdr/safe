@@ -12,6 +12,8 @@ Copy the script to your PATH
 safe claude              # runs claude --dangerously-skip-permissions in the sandbox
 safe codex               # etc.
 safe opencode            # etc.
+
+# Subcommands
 safe clear-policy-cache  # delete cached SBPL policies under ~/.cache/safe
 safe install             # copy safe to ~/.local/bin/safe and clear the policy cache
 ```
