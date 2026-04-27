@@ -30,15 +30,20 @@ def install_self!
   puts "safe: installed to #{target}"
 end
 
+def clear_policy_cache!
+  policies = Dir[File.expand_path('~/.cache/safe/policy-*.sb')]
+  policies.each { |p| File.delete(p) }
+  puts "safe: removed #{policies.length} cached polic#{policies.length == 1 ? 'y' : 'ies'}"
+end
+
 if ARGV.first == 'install'
   install_self!
+  clear_policy_cache!
   exit 0
 end
 
 if ARGV.first == 'clear-policy-cache'
-  policies = Dir[File.expand_path('~/.cache/safe/policy-*.sb')]
-  policies.each { |p| File.delete(p) }
-  puts "safe: removed #{policies.length} cached polic#{policies.length == 1 ? 'y' : 'ies'}"
+  clear_policy_cache!
   exit 0
 end
 
