@@ -118,8 +118,9 @@ RECIPES = {
   'claude' => {
     'read'  => %w[~/.agents],
     'write' => %w[~/.claude ~/.claude.json ~/.config/claude ~/.cache/claude
-                  ~/.local/share/claude ~/.local/state/claude ~/.local/bin/claude],
-    'mach'  => %w[com.apple.SecurityServer],
+                  ~/.local/share/claude ~/.local/state/claude ~/.local/bin/claude
+                  ~/Library/Keychains/],
+    'mach'  => %w[com.apple.SecurityServer com.apple.lsd.mapdb],
   },
   'codex' => {
     'write' => %w[~/.codex ~/.cache/codex ~/.local/bin/codex],
@@ -161,6 +162,7 @@ BASELINE = <<~SB
     (literal "/Library/Preferences/.GlobalPreferences.plist")
     (literal "/dev") (literal "/private") (literal "/private/var")
     (subpath "/private/var/db/timezone")
+    (subpath "/private/var/db/mds")
     (subpath "/private/var/select")
     (literal "/private/etc/hosts") (literal "/private/etc/resolv.conf")
     (literal "/private/etc/services") (literal "/private/etc/protocols")
