@@ -116,6 +116,7 @@ RECIPES = {
     'write' => %w[~/.config/gh ~/.cache/gh ~/.local/share/gh ~/.local/state/gh],
   },
   'claude' => {
+    'read'  => %w[~/.agents],
     'write' => %w[~/.claude ~/.claude.json ~/.config/claude ~/.cache/claude
                   ~/.local/share/claude ~/.local/state/claude ~/.local/bin/claude],
     'mach'  => %w[com.apple.SecurityServer],
