@@ -390,10 +390,24 @@ File.write(policy, render_policy(cfg)) unless File.exist?(policy)
 # can be detected without shelling out to `aws`.
 AWS_REFRESH_LEEWAY = 300  # seconds before expiry at which we refresh
 
+def aws_configure_get(key, profile)
+  IO.popen(['aws', 'configure', 'get', key, '--profile', profile], err: File::NULL, &:read).strip rescue ''
+end
+
 def aws_export(profile)
   out = IO.popen(['aws', 'configure', 'export-credentials', '--profile', profile, '--format', 'process'], err: [:child, :out], &:read)
   raise "aws export-credentials for profile #{profile} failed: #{out.strip}" unless $?.success?
   JSON.parse(out)
+end
+
+def aws_assume_role(profile, role_arn, source_profile)
+  cmd = ['aws', 'sts', 'assume-role',
+         '--profile', source_profile,
+         '--role-arn', role_arn,
+         '--role-session-name', 'safe']
+  out = IO.popen(cmd, err: [:child, :out], &:read)
+  raise "aws sts assume-role for profile #{profile} failed: #{out.strip}" unless $?.success?
+  JSON.parse(out).fetch('Credentials')
 end
 
 # Write under [default] AND [<profile>] so clients work whether AWS_PROFILE is
@@ -444,11 +458,19 @@ def aws_ensure_fresh!(aws_dir, profile)
   File.open(File.join(aws_dir, 'lock'), File::RDWR | File::CREAT, 0o600) do |lock|
     lock.flock(File::LOCK_EX)
     return unless aws_creds_stale?(aws_dir)  # another session may have refreshed while we waited
-    region = (IO.popen(['aws', 'configure', 'get', 'region', '--profile', profile], err: File::NULL, &:read).strip rescue '')
+    region = aws_configure_get('region', profile)
     aws_write_config(File.join(aws_dir, 'config'), region, profile)
-    creds = aws_export(profile)
+    role_arn      = aws_configure_get('role_arn', profile)
+    source_profile = aws_configure_get('source_profile', profile)
+    creds = if role_arn.empty?
+      aws_export(profile)
+    else
+      aws_assume_role(profile, role_arn, source_profile.empty? ? profile : source_profile)
+    end
     aws_write_creds(File.join(aws_dir, 'credentials'), creds, profile)
-    File.write(File.join(aws_dir, 'meta.json'), JSON.dump('expiration' => creds['Expiration']))
+    expiration = creds['Expiration']
+    expiration ||= (Time.now + 900).utc.iso8601 if creds['SessionToken']
+    File.write(File.join(aws_dir, 'meta.json'), JSON.dump('expiration' => expiration))
   end
 end
 
